@@ -2,21 +2,36 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"image/png"
 	"os"
-	"path"
+	"path/filepath"
 
 	"github.com/gaboose/ldtkbuddy/ldtkslim"
 )
 
-func trimmedFilename(name string) string {
-	ext := path.Ext(name)
-	return name[:len(name)-len(ext)] + "_trimmed" + ext
+var outDir = flag.String("o", "out", "output directory")
+
+func outputPath(filename string) string {
+	return filepath.Join(*outDir, filename)
 }
 
 func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: ldtkbuddy [-o dir] level.ldtk\n")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
+	if flag.NArg() != 1 {
+		flag.Usage()
+		os.Exit(2)
+	}
 	ldtkPath := flag.Arg(0)
+	if *outDir != "" {
+		if err := os.MkdirAll(*outDir, 0755); err != nil {
+			panic(err)
+		}
+	}
 
 	ts, err := NewTilesetShrinker(ldtkPath)
 	if err != nil {
@@ -37,14 +52,13 @@ func main() {
 		panic(err)
 	}
 
-	if err := os.WriteFile(trimmedFilename(ldtkPath), bts, 0600); err != nil {
+	if err := os.WriteFile(outputPath(filepath.Base(ldtkPath)), bts, 0644); err != nil {
 		panic(err)
 	}
 
-	ldtkDir := path.Dir(ldtkPath)
 	for p, img := range ts.Tilesets {
 		func() {
-			f, err := os.Create(path.Join(ldtkDir, trimmedFilename(p)))
+			f, err := os.Create(outputPath(p))
 			if err != nil {
 				panic(err)
 			}

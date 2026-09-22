@@ -92,10 +92,15 @@ func (ts *TilesetShrinker) Shrink() error {
 			tileIDMap[k] = int64(i)
 		}
 
-		sqrt := int64(math.Sqrt(float64(len(tileIDMap)))) + 1
+		n := int64(len(tileIDMap))
+		w := int64(math.Ceil(math.Sqrt(float64(n))))
+		if w == 0 {
+			w = 1
+		}
+
 		tilesetChanges[path] = TilesetChanges{
-			Width:     sqrt,
-			Height:    sqrt,
+			Width:     w,
+			Height:    w,
 			TileIDMap: tileIDMap,
 		}
 	}
@@ -125,6 +130,18 @@ func (ts *TilesetShrinker) Shrink() error {
 		}
 	}
 
+	// Drop tileset defs no layer uses.
+	kept := ts.LDtk.Defs.Tilesets[:0]
+	for _, tileset := range ts.LDtk.Defs.Tilesets {
+		if tileset.RelPath == nil {
+			continue
+		}
+		if _, ok := tilesetChanges[*tileset.RelPath]; ok {
+			kept = append(kept, tileset)
+		}
+	}
+	ts.LDtk.Defs.Tilesets = kept
+
 	// Apply tileset changes on tileset defs
 	for i, tileset := range ts.LDtk.Defs.Tilesets {
 		if tileset.RelPath == nil {
@@ -136,10 +153,16 @@ func (ts *TilesetShrinker) Shrink() error {
 			continue
 		}
 
-		for _, enumTag := range tileset.EnumTags {
-			for j := range enumTag.TileIDS {
-				enumTag.TileIDS[j] = tc.TileIDMap[enumTag.TileIDS[j]]
+		// Drop tags on tiles that were trimmed away. Indexing the map directly
+		// would turn every such id into 0 and tag the first kept tile instead.
+		for k, enumTag := range tileset.EnumTags {
+			kept := enumTag.TileIDS[:0]
+			for _, id := range enumTag.TileIDS {
+				if newID, ok := tc.TileIDMap[id]; ok {
+					kept = append(kept, newID)
+				}
 			}
+			ts.LDtk.Defs.Tilesets[i].EnumTags[k].TileIDS = kept
 		}
 
 		// Remap custom data: tile IDs and relative animation offsets.
@@ -190,13 +213,11 @@ func (ts *TilesetShrinker) Shrink() error {
 		gridSize := tilesetInfos[p].gridSize
 		newImg := image.NewRGBA(image.Rect(0, 0, int(tc.Width*gridSize), int(tc.Height*gridSize)))
 
-		fmt.Println(p, tc.TileIDMap)
 		for oldT, newT := range tc.TileIDMap {
 			newPxX := int((newT % tc.Width) * gridSize)
 			newPxY := int(newT / tc.Width * gridSize)
 			oldPxX := (int(oldT) % divUp(oldImg.Bounds().Max.X, int(gridSize)) * int(gridSize))
 			oldPxY := (int(oldT) / divUp(oldImg.Bounds().Max.X, int(gridSize)) * int(gridSize))
-			fmt.Println(oldT, newT, newPxX, newPxY, oldPxX, oldPxY, gridSize, oldImg.Bounds())
 			draw.Draw(
 				newImg,
 				image.Rect(newPxX, newPxY, newPxX+int(gridSize), newPxY+int(gridSize)),

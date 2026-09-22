@@ -26,6 +26,7 @@ type Defs struct {
 
 type Tileset struct {
 	PxWid        int              `json:"pxWid"`
+	RelPath      *string          `json:"relPath"`
 	TileGridSize int              `json:"tileGridSize"`
 	EnumTags     []EnumTag        `json:"enumTags"`
 	CustomData   []TileCustomData `json:"customData"`
