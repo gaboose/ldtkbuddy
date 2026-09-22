@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/draw"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strings"
 
 	"github.com/gaboose/ldtkbuddy/ldtk"
 )
@@ -30,7 +32,11 @@ func NewTilesetShrinker(ldtkPath string) (TilesetShrinker, error) {
 	}
 
 	tilesets := map[string]image.Image{}
-	for p := range analyzeTilesets(l) {
+	tilesetInfos, err := analyzeTilesets(l)
+	if err != nil {
+		return TilesetShrinker{}, fmt.Errorf("failed to analyze tilesets: %w", err)
+	}
+	for p := range tilesetInfos {
 		ldtkDir := path.Dir(ldtkPath)
 		tilesetPath := path.Join(ldtkDir, p)
 		if err := func() error {
@@ -59,7 +65,10 @@ func NewTilesetShrinker(ldtkPath string) (TilesetShrinker, error) {
 }
 
 func (ts *TilesetShrinker) Shrink() error {
-	tilesetInfos := analyzeTilesets(ts.LDtk)
+	tilesetInfos, err := analyzeTilesets(ts.LDtk)
+	if err != nil {
+		return fmt.Errorf("failed to analyze assets: %w", err)
+	}
 
 	type TilesetChanges struct {
 		Width     int64
@@ -122,7 +131,10 @@ func (ts *TilesetShrinker) Shrink() error {
 			continue
 		}
 
-		tc := tilesetChanges[*tileset.RelPath]
+		tc, ok := tilesetChanges[*tileset.RelPath]
+		if !ok {
+			continue
+		}
 
 		for _, enumTag := range tileset.EnumTags {
 			for j := range enumTag.TileIDS {
@@ -130,6 +142,44 @@ func (ts *TilesetShrinker) Shrink() error {
 			}
 		}
 
+		// Remap custom data: tile IDs and relative animation offsets.
+		// Offsets must be resolved against the OLD column count before CWid is updated.
+		oldCWid := tileset.CWid
+		newCustomData := tileset.CustomData[:0:0]
+		for _, cd := range tileset.CustomData {
+			newTileID, ok := tc.TileIDMap[cd.TileID]
+			if !ok {
+				continue
+			}
+
+			offsets, err := parseAnimationOffsets(cd.Data)
+			if err != nil {
+				return fmt.Errorf("parsing animationOffsets of tile %d in %s: %w", cd.TileID, *tileset.RelPath, err)
+			}
+
+			if len(offsets) > 0 {
+				newOffsets := make([]Offset, 0, len(offsets))
+				for _, o := range offsets {
+					oldRef := cd.TileID + o.X + o.Y*oldCWid
+					newRef, ok := tc.TileIDMap[oldRef]
+					if !ok {
+						return fmt.Errorf("tile %d in %s: animation frame tile %d missing from remap", cd.TileID, *tileset.RelPath, oldRef)
+					}
+					newOffsets = append(newOffsets, Offset{
+						X: newRef%tc.Width - newTileID%tc.Width,
+						Y: newRef/tc.Width - newTileID/tc.Width,
+					})
+				}
+				cd.Data = replaceAnimationOffsets(cd.Data, newOffsets)
+			}
+
+			cd.TileID = newTileID
+			newCustomData = append(newCustomData, cd)
+		}
+		ts.LDtk.Defs.Tilesets[i].CustomData = newCustomData
+
+		ts.LDtk.Defs.Tilesets[i].CWid = tc.Width
+		ts.LDtk.Defs.Tilesets[i].CHei = tc.Height
 		ts.LDtk.Defs.Tilesets[i].PxWid = tc.Width * tilesetInfos[*tileset.RelPath].gridSize
 		ts.LDtk.Defs.Tilesets[i].PxHei = tc.Height * tilesetInfos[*tileset.RelPath].gridSize
 	}
@@ -167,7 +217,7 @@ type tilesetInfo struct {
 	gridSize  int64
 }
 
-func analyzeTilesets(l ldtk.LDtk) map[string]tilesetInfo {
+func analyzeTilesets(l ldtk.LDtk) (map[string]tilesetInfo, error) {
 	// Get used tiles over all levels and tilesets
 	ret := map[string]tilesetInfo{}
 	for _, level := range l.Levels {
@@ -196,7 +246,92 @@ func analyzeTilesets(l ldtk.LDtk) map[string]tilesetInfo {
 		}
 	}
 
-	return ret
+	// Get tiles referenced in tileset custom data
+	for _, ts := range l.Defs.Tilesets {
+		if ts.RelPath == nil {
+			continue
+		}
+		ti, ok := ret[*ts.RelPath]
+		if !ok {
+			continue
+		}
+
+		for _, cd := range ts.CustomData {
+			if _, ok := ti.usedTiles[cd.TileID]; !ok {
+				continue
+			}
+
+			offsets, err := parseAnimationOffsets(cd.Data)
+			if err != nil {
+				return nil, fmt.Errorf("parsing animationOffset: %w", err)
+			}
+
+			for _, o := range offsets {
+				refID := cd.TileID + o.X + o.Y*ts.CWid
+				ti.usedTiles[refID] = struct{}{}
+			}
+		}
+
+		ret[*ts.RelPath] = ti
+	}
+
+	return ret, nil
+}
+
+// Offset is a single animation frame offset.
+type Offset struct {
+	X, Y int64
+}
+
+const animationKey = "animationOffsets"
+
+func parseAnimationOffsets(data string) ([]Offset, error) {
+	// Custom data is free text and may hold several keys, one per line.
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+
+		rest, ok := strings.CutPrefix(line, animationKey+" ")
+		if !ok {
+			continue
+		}
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			return nil, fmt.Errorf("%s has no values", animationKey)
+		}
+
+		var pairs [][]int64
+		if err := json.Unmarshal([]byte("["+rest+"]"), &pairs); err != nil {
+			return nil, fmt.Errorf("parsing %q: %w", rest, err)
+		}
+
+		offsets := make([]Offset, 0, len(pairs))
+		for i, p := range pairs {
+			if len(p) != 2 {
+				return nil, fmt.Errorf("offset %d has %d values, want 2", i, len(p))
+			}
+			offsets = append(offsets, Offset{X: p[0], Y: p[1]})
+		}
+		return offsets, nil
+	}
+	return nil, nil
+}
+
+// replaceAnimationOffsets rewrites the animationOffsets line in custom data
+// leaving any other lines untouched.
+func replaceAnimationOffsets(data string, offsets []Offset) string {
+	lines := strings.Split(data, "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), animationKey+" ") {
+			continue
+		}
+		parts := make([]string, len(offsets))
+		for j, o := range offsets {
+			parts[j] = fmt.Sprintf("[%d,%d]", o.X, o.Y)
+		}
+		lines[i] = animationKey + " " + strings.Join(parts, ",")
+		break
+	}
+	return strings.Join(lines, "\n")
 }
 
 func divUp(left, right int) int {
