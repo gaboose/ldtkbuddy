@@ -43,6 +43,7 @@ type TileCustomData struct {
 }
 
 type Level struct {
+	Identifier     string          `json:"identifier"`
 	BgColor        string          `json:"__bgColor"`
 	LayerInstances []LayerInstance `json:"layerInstances"`
 }
@@ -51,6 +52,7 @@ type LayerInstance struct {
 	Identifier      string           `json:"__identifier"`
 	CWid            int              `json:"__cWid"`
 	CHei            int              `json:"__cHei"`
+	GridSize        int              `json:"__gridSize"`
 	GridTiles       []Tile           `json:"gridTiles"`
 	AutoLayerTiles  []Tile           `json:"autoLayerTiles"`
 	EntityInstances []EntityInstance `json:"entityInstances"`
@@ -64,6 +66,9 @@ type Tile struct {
 }
 
 type EntityInstance struct {
-	Identifier string `json:"__identifier"`
-	Px         [2]int `json:"px"`
+	Identifier string     `json:"__identifier"`
+	Px         [2]int     `json:"px"`
+	Width      int        `json:"width"`
+	Height     int        `json:"height"`
+	Pivot      [2]float64 `json:"__pivot"`
 }
