@@ -66,9 +66,16 @@ type Tile struct {
 }
 
 type EntityInstance struct {
-	Identifier string     `json:"__identifier"`
-	Px         [2]int     `json:"px"`
-	Width      int        `json:"width"`
-	Height     int        `json:"height"`
-	Pivot      [2]float64 `json:"__pivot"`
+	Identifier     string          `json:"__identifier"`
+	Px             [2]int          `json:"px"`
+	Width          int             `json:"width"`
+	Height         int             `json:"height"`
+	Pivot          [2]float64      `json:"__pivot"`
+	Iid            string          `json:"iid"`
+	FieldInstances []FieldInstance `json:"fieldInstances"`
+}
+
+type FieldInstance struct {
+	Identifier string          `json:"__identifier"`
+	Value      json.RawMessage `json:"__value"`
 }
