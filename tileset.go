@@ -74,6 +74,28 @@ func (ts *TilesetShrinker) Shrink() error {
 		Width     int64
 		Height    int64
 		TileIDMap map[int64]int64
+		// Free-form rects (entity field tiles) copied below the tile grid.
+		RectPos map[rectKey]rectKey
+	}
+
+	// Tile rects referenced by entity fields, grouped by tileset path.
+	uidToPath := map[int64]string{}
+	for _, def := range ts.LDtk.Defs.Tilesets {
+		if def.RelPath != nil {
+			uidToPath[def.Uid] = *def.RelPath
+		}
+	}
+	rectRefs := collectRectRefs(ts.LDtk)
+	rectsByPath := map[string]map[rectKey]struct{}{}
+	for _, r := range rectRefs {
+		p, ok := uidToPath[r.key().uid]
+		if _, used := tilesetInfos[p]; !ok || !used {
+			continue
+		}
+		if rectsByPath[p] == nil {
+			rectsByPath[p] = map[rectKey]struct{}{}
+		}
+		rectsByPath[p][r.key()] = struct{}{}
 	}
 
 	// Build remap
@@ -98,10 +120,60 @@ func (ts *TilesetShrinker) Shrink() error {
 			w = 1
 		}
 
+		// Pack field rects in shelves below the tile grid, keeping them
+		// intact. The atlas is widened if a rect doesn't fit.
+		grid := ti.gridSize
+		rects := make([]rectKey, 0, len(rectsByPath[path]))
+		for k := range rectsByPath[path] {
+			rects = append(rects, k)
+		}
+		sort.Slice(rects, func(i, j int) bool {
+			a, b := rects[i], rects[j]
+			if a.h != b.h {
+				return a.h > b.h
+			}
+			if a.w != b.w {
+				return a.w > b.w
+			}
+			if a.x != b.x {
+				return a.x < b.x
+			}
+			return a.y < b.y
+		})
+		for _, r := range rects {
+			if cells := divUp(int(r.w), int(grid)); int64(cells) > w {
+				w = int64(cells)
+			}
+		}
+		rows := int64(divUp(int(n), int(w)))
+		if n == 0 {
+			rows = 0
+		}
+		rectPos := make(map[rectKey]rectKey, len(rects))
+		var curX, shelfY, shelfH int64
+		shelfY = rows * grid
+		for _, r := range rects {
+			if curX+r.w > w*grid {
+				shelfY += shelfH
+				curX, shelfH = 0, 0
+			}
+			rectPos[r] = rectKey{uid: r.uid, x: curX, y: shelfY, w: r.w, h: r.h}
+			curX += r.w
+			shelfH = max(shelfH, r.h)
+		}
+		height := int64(divUp(int(shelfY+shelfH), int(grid)))
+		if height < 1 {
+			height = 1
+		}
+		if n > 0 && rows > height {
+			height = rows
+		}
+
 		tilesetChanges[path] = TilesetChanges{
 			Width:     w,
-			Height:    w,
+			Height:    height,
 			TileIDMap: tileIDMap,
+			RectPos:   rectPos,
 		}
 	}
 
@@ -127,6 +199,18 @@ func (ts *TilesetShrinker) Shrink() error {
 				layer.AutoLayerTiles[i].T = newT
 				layer.AutoLayerTiles[i].Src = []int64{newT % tc.Width * layer.GridSize, newT / tc.Width * layer.GridSize}
 			}
+		}
+	}
+
+	// Point entity field tiles at their new position in the atlas.
+	for _, r := range rectRefs {
+		k := r.key()
+		p, ok := uidToPath[k.uid]
+		if !ok {
+			continue
+		}
+		if np, ok := tilesetChanges[p].RectPos[k]; ok {
+			r.set(np.x, np.y)
 		}
 	}
 
@@ -223,6 +307,16 @@ func (ts *TilesetShrinker) Shrink() error {
 				image.Rect(newPxX, newPxY, newPxX+int(gridSize), newPxY+int(gridSize)),
 				oldImg,
 				image.Pt(oldPxX, oldPxY),
+				draw.Src,
+			)
+		}
+
+		for oldR, newR := range tc.RectPos {
+			draw.Draw(
+				newImg,
+				image.Rect(int(newR.x), int(newR.y), int(newR.x+newR.w), int(newR.y+newR.h)),
+				oldImg,
+				image.Pt(int(oldR.x), int(oldR.y)),
 				draw.Src,
 			)
 		}
@@ -361,4 +455,71 @@ func divUp(left, right int) int {
 		q += 1
 	}
 	return q
+}
+
+// rectKey is a pixel rect in a tileset image.
+type rectKey struct{ uid, x, y, w, h int64 }
+
+// rectRef is one tile rect stored on an entity: its __tile, a Tile field or
+// an element of an Array<Tile> field.
+type rectRef struct {
+	k   func() rectKey
+	put func(x, y int64)
+}
+
+func (r rectRef) key() rectKey   { return r.k() }
+func (r rectRef) set(x, y int64) { r.put(x, y) }
+
+func collectRectRefs(l ldtk.LDtk) []rectRef {
+	var out []rectRef
+	fromRect := func(t *ldtk.TilesetRectangle) {
+		if t == nil {
+			return
+		}
+		out = append(out, rectRef{
+			k:   func() rectKey { return rectKey{t.TilesetUid, t.X, t.Y, t.W, t.H} },
+			put: func(x, y int64) { t.X, t.Y = x, y },
+		})
+	}
+	fromMap := func(m map[string]interface{}) {
+		num := func(k string) int64 { f, _ := m[k].(float64); return int64(f) }
+		if _, ok := m["tilesetUid"]; !ok {
+			return
+		}
+		out = append(out, rectRef{
+			k:   func() rectKey { return rectKey{num("tilesetUid"), num("x"), num("y"), num("w"), num("h")} },
+			put: func(x, y int64) { m["x"], m["y"] = float64(x), float64(y) },
+		})
+	}
+	fromFields := func(fields []ldtk.FieldInstance) {
+		for i := range fields {
+			f := &fields[i]
+			fromRect(f.Tile)
+			switch v := f.Value.(type) {
+			case map[string]interface{}:
+				if f.Type == "Tile" {
+					fromMap(v)
+				}
+			case []interface{}:
+				if f.Type == "Array<Tile>" {
+					for _, el := range v {
+						if m, ok := el.(map[string]interface{}); ok {
+							fromMap(m)
+						}
+					}
+				}
+			}
+		}
+	}
+	for li := range l.Levels {
+		for yi := range l.Levels[li].LayerInstances {
+			layer := &l.Levels[li].LayerInstances[yi]
+			for ei := range layer.EntityInstances {
+				e := &layer.EntityInstances[ei]
+				fromRect(e.Tile)
+				fromFields(e.FieldInstances)
+			}
+		}
+	}
+	return out
 }
